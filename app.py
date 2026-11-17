@@ -92,7 +92,10 @@ CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap');
 
-html, body, [class*="st-"], .stMarkdown, button, input, label, textarea {
+/* Text elements only. A broad selector like [class*="st-"] would also hit Streamlit's icon
+   font, and the icons would then render as their names ("keyboard_arrow_down"). */
+html, body, .stApp, p, li, label, input, textarea, button, h1, h2, h3, h4,
+[data-testid="stMarkdownContainer"] {
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
 }
 .block-container {max-width: 640px; padding-top: 2.5rem; padding-bottom: 5rem;}

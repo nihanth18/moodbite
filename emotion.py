@@ -131,6 +131,10 @@ class MediaPipeDetector:
 # --- HSEmotion ------------------------------------------------------------------------------
 class HSEmotionModel:
     def __init__(self, model_name: str = HSE_MODEL):
+        # hsemotion_onnx downloads its model with urllib.request.urlretrieve but only does
+        # `import urllib`, which fails on a fresh server unless the submodule is already loaded.
+        import urllib.request  # noqa: F401
+
         from hsemotion_onnx.facial_emotions import HSEmotionRecognizer
 
         self._rec = HSEmotionRecognizer(model_name=model_name)
