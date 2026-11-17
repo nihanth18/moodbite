@@ -59,10 +59,17 @@ def test_feature_value_defaults():
     assert feature_value({}, "dessert") == 0.0
 
 
-def test_rating_dominates_when_mood_is_neutral(cfg, candidates):
-    top = Recommender(cfg).rank(make_mood(neutral=1.0), candidates, MAX_M, hour=12, k=3)
-    best = sorted(candidates, key=lambda r: r.weighted_rating, reverse=True)[:5]
-    assert {t.restaurant.id for t in top} <= {r.id for r in best}
+def test_neutral_mood_uses_only_rating_and_distance(cfg, candidates):
+    """No mood rules, no cravings: the score is just rating + closeness (+ intent, which is 0)."""
+    top = Recommender(cfg).rank(make_mood(neutral=1.0), candidates, MAX_M, hour=12, k=1)[0]
+    base = cfg["base_weights"]
+
+    def base_score(r):
+        f = r.features(MAX_M)
+        return base["rating"] * feature_value(f, "rating") + base["closeness"] * f["closeness"]
+
+    assert top.restaurant.id == max(candidates, key=base_score).id
+    assert top.score == pytest.approx(base_score(top.restaurant))
 
 
 def test_mood_changes_the_score(cfg):

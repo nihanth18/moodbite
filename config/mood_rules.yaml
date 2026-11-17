@@ -1,4 +1,4 @@
-# MoodBite rule-based ranking config (Phase 1).
+# Mood and taste ranking config.
 #
 # Mood signals available to conditions:
 #   valence, arousal        in [-1, 1] (from HSEmotion)
@@ -6,58 +6,105 @@
 #   happy, sad, neutral, surprise, angry, fear, disgust   (probabilities, 0..1)
 #
 # Condition keys: <signal>_above / <signal>_below. All conditions in a rule must hold.
-# Weights apply to restaurant tags/features:
-#   comfort_food, quick_service, lively, quiet, dessert, familiar  (0/1 tags)
-#   rating (0..1, review-count-adjusted rating mapped from 3.5..5.0), closeness (1 = right here,
-#   0 = at max distance)
 #
-# Only open places rated 4.0+ with 30+ reviews reach the ranker (see places.py).
-# Rating carries the largest base weight, so mood picks among the best-rated places.
+# Weights apply to restaurant features (all in 0..1):
+#   tags: comfort_food, quick_service, lively, quiet, dessert, familiar, outdoor, spicy,
+#         light, coffee   (1.0 = strong evidence, 0.3-0.5 = weak evidence)
+#   rating      review-count-adjusted rating mapped from 3.5..5.0
+#   closeness   1 = right here, 0 = at max distance
+#   intent_match 1 if the place came back from one of this mood's/craving's own searches
+#
+# `queries` are extra Google searches run for that mood/craving, so mood changes WHICH
+# places are considered, not only their order. At most `retrieval.max_queries` run per search.
 
 detection:
   min_face_confidence: 0.6      # MediaPipe detection score below this -> "low confidence"
   min_emotion_confidence: 0.30  # top emotion probability below this -> treat mood as uncertain
 
-# Always applied, regardless of mood.
+# Always applied. Everything shown is already open and rated 4.0+, so rating only needs to
+# break ties; mood and cravings should decide.
 base_weights:
-  rating: 2.0
-  closeness: 0.6
+  rating: 1.0
+  closeness: 0.5
+  intent_match: 0.8
+
+retrieval:
+  max_queries: 3          # extra Google Text Searches per search (each one is billed)
+
+diversity:
+  max_per_cuisine: 2      # at most this many picks of the same cuisine in the top 5
+  repeat_penalty: 0.4     # score penalty for each earlier pick with the same cuisine
 
 rules:
   - name: low_energy
-    when: {arousal_below: -0.1}
-    weights: {comfort_food: 1.2, quick_service: 0.8, quiet: 0.3}
-    why: "You look a bit low on energy, so here's something comforting and quick"
+    when: {arousal_below: -0.3}
+    weights: {comfort_food: 1.2, quick_service: 0.8, quiet: 0.3, lively: -0.5}
+    queries: ["comfort food", "biryani"]
+    why: "You look a bit low on energy, so here's something comforting and easy"
 
   - name: upbeat
     when: {valence_above: 0.3, arousal_above: 0.2}
-    weights: {lively: 1.3, familiar: -0.2}
+    weights: {lively: 1.3, outdoor: 0.6, quiet: -0.4}
+    queries: ["rooftop restaurant", "live music restaurant"]
     why: "You're in a great mood, so here's somewhere lively"
 
   - name: content_calm
     when: {valence_above: 0.2, arousal_below: 0.2}
-    weights: {quiet: 0.8, rating: 0.4}
-    why: "You seem relaxed, so here's a calm, well-rated spot"
+    weights: {quiet: 1.0, coffee: 0.5, outdoor: 0.5, lively: -0.5}
+    queries: ["cafe", "garden restaurant"]
+    why: "You seem relaxed, so here's a calm spot to settle into"
 
   - name: stressed
     when: {stress_above: 0.35}
-    weights: {dessert: 1.2, familiar: 0.9, quiet: 0.5, lively: -0.4}
-    why: "You look a little stressed, so here's a familiar spot with a sweet treat"
+    weights: {dessert: 1.2, quiet: 0.8, familiar: 0.6, lively: -0.6}
+    queries: ["desserts", "quiet cafe"]
+    why: "You look a little stressed, so here's somewhere calm with something sweet"
 
   - name: down
     when: {sad_above: 0.35}
-    weights: {comfort_food: 1.3, dessert: 0.7}
+    weights: {comfort_food: 1.3, dessert: 0.8, familiar: 0.4}
+    queries: ["comfort food", "ice cream"]
     why: "Looks like a comfort-food kind of moment"
 
   - name: surprised_curious
     when: {surprise_above: 0.4}
     weights: {familiar: -0.6, lively: 0.4}
+    queries: ["fusion restaurant"]
     why: "You look curious, so here's something a little different"
 
-# Fallback reason when no mood rule fires.
+# Optional cravings the user can tap. They count more than the face, because they are
+# stated directly.
+cravings:
+  Spicy:
+    weights: {spicy: 1.6}
+    queries: ["biryani", "andhra meals"]
+    why: "Spicy, like you asked for"
+  Sweet:
+    weights: {dessert: 1.6}
+    queries: ["desserts", "ice cream"]
+    why: "Something sweet, like you asked for"
+  Light:
+    weights: {light: 1.6, comfort_food: -0.4}
+    queries: ["healthy food", "salad"]
+    why: "Something light, like you asked for"
+  Hearty:
+    weights: {comfort_food: 1.4}
+    queries: ["thali", "mandi"]
+    why: "A proper hearty meal, like you asked for"
+  Coffee:
+    weights: {coffee: 1.6, quiet: 0.3}
+    queries: ["cafe"]
+    why: "Good coffee, like you asked for"
+  Drinks:
+    weights: {lively: 1.4}
+    queries: ["bar", "brewery"]
+    why: "Drinks and a buzz, like you asked for"
+
+# Fallback reason when no mood rule or craving fits.
 default_why: "One of the best-rated places open near you"
 
 bandit:
   min_events: 20   # below this many feedback events, use rules only
   alpha: 0.6       # LinUCB exploration strength
   ridge: 1.0       # L2 regularisation (A = ridge * I initially)
+  weight: 1.0      # learned score is added to the rule score with this weight

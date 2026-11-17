@@ -1,25 +1,31 @@
-"""Ranking: Phase 1 rule-based mood->feature weights, Phase 2 LinUCB contextual bandit."""
+"""Ranking: rule-based mood/craving -> feature weights, plus a LinUCB contextual bandit.
+
+Score = rule score (rating, distance, mood rules, cravings, intent match)
+        + bandit.weight * LinUCB(mood ⊗ restaurant, time of day)   once there's enough feedback.
+The top k are then picked greedily with a per-cuisine cap so the list isn't all one cuisine.
+"""
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import yaml
 
 from emotion import EMOTIONS, MoodVector
-from places import Restaurant
+from places import TAGS, Restaurant
 
 DEFAULT_RULES_PATH = Path(__file__).parent / "config" / "mood_rules.yaml"
 
 MOOD_FEATURES = ("bias", "valence", "arousal", "stress", "sad", "happy")
-REST_FEATURES = ("bias", "rating", "closeness", "comfort_food", "quick_service",
-                 "lively", "quiet", "dessert", "familiar")
+REST_FEATURES = ("bias", "rating", "closeness", "intent_match", *TAGS)
 # Candidates are already 4.0+, so spread 3.5..5.0 over 0..1 to make rating differences count.
 RATING_FLOOR, RATING_CEIL = 3.5, 5.0
 TIME_BUCKETS = ("morning", "afternoon", "evening", "night")
 CONTEXT_DIM = len(MOOD_FEATURES) * len(REST_FEATURES) + len(TIME_BUCKETS)
+FEATURE_NAMES = set(REST_FEATURES) - {"bias"}
 
 
 def load_rules(path: str | Path = DEFAULT_RULES_PATH) -> dict[str, Any]:
@@ -28,7 +34,17 @@ def load_rules(path: str | Path = DEFAULT_RULES_PATH) -> dict[str, Any]:
     for rule in cfg.get("rules", []):
         for key in rule.get("when", {}):
             _parse_condition(key)  # fail fast on typos
+        _check_weights(rule.get("weights", {}), rule.get("name", "?"))
+    for name, craving in (cfg.get("cravings") or {}).items():
+        _check_weights(craving.get("weights", {}), name)
     return cfg
+
+
+def _check_weights(weights: dict[str, float], owner: str) -> None:
+    bad = set(weights) - FEATURE_NAMES
+    if bad:
+        raise ValueError(f"unknown feature(s) {sorted(bad)} in {owner!r}; "
+                         f"use {sorted(FEATURE_NAMES)}")
 
 
 @dataclass
@@ -83,40 +99,65 @@ def active_rules(cfg: dict[str, Any], mood: MoodVector) -> list[dict[str, Any]]:
     return [r for r in cfg.get("rules", []) if rule_matches(r.get("when", {}), s)]
 
 
-def explain(cfg: dict[str, Any], rules: list[dict[str, Any]], features: dict[str, Any],
-            mood_weight: float = 1.0) -> str:
-    """One-line 'why': the mood rule that contributes most to this restaurant's score.
+def active_cravings(cfg: dict[str, Any], cravings: Iterable[str]) -> list[dict[str, Any]]:
+    table = cfg.get("cravings") or {}
+    return [{"name": c, **table[c]} for c in cravings if c in table]
 
-    The matching tags (comfort food, quiet, ...) and the distance are shown separately on the card.
+
+def search_queries(cfg: dict[str, Any], mood: MoodVector,
+                   cravings: Iterable[str] = ()) -> list[str]:
+    """Extra Google searches for this mood: cravings first (stated directly), then mood rules."""
+    limit = int((cfg.get("retrieval") or {}).get("max_queries", 3))
+    queries: list[str] = []
+    for item in active_cravings(cfg, cravings) + active_rules(cfg, mood):
+        for q in item.get("queries", []):
+            if q not in queries:
+                queries.append(q)
+    return queries[:limit]
+
+
+def _contribution(weights: dict[str, float], features: dict[str, Any]) -> float:
+    return sum(w * feature_value(features, n) for n, w in weights.items())
+
+
+def explain(cfg: dict[str, Any], rules: list[dict[str, Any]], features: dict[str, Any],
+            mood_weight: float = 1.0, cravings: list[dict[str, Any]] | None = None) -> str:
+    """One-line 'why': the craving or mood rule that contributes most to this place's score.
+
+    The matching tags and the distance are shown separately on the card.
     """
     best, best_contrib = None, 0.0
+    for craving in cravings or []:
+        c = _contribution(craving.get("weights", {}), features)
+        if c > best_contrib:
+            best, best_contrib = craving, c
     for rule in rules:
-        contrib = sum(w * feature_value(features, name)
-                      for name, w in rule.get("weights", {}).items())
-        if contrib * mood_weight > best_contrib:
-            best, best_contrib = rule, contrib * mood_weight
+        c = _contribution(rule.get("weights", {}), features) * mood_weight
+        if c > best_contrib:
+            best, best_contrib = rule, c
     if best is None:
         return f"{cfg.get('default_why', 'A top-rated place near you')}."
     return f"{best['why']}."
 
 
-# --- Phase 1: rules ------------------------------------------------------------------------
+# --- rules ---------------------------------------------------------------------------------
 class RuleRanker:
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
 
     def score(self, mood: MoodVector, features: dict[str, Any],
-              rules: list[dict[str, Any]] | None = None, mood_weight: float = 1.0) -> float:
+              rules: list[dict[str, Any]] | None = None, mood_weight: float = 1.0,
+              cravings: list[dict[str, Any]] | None = None) -> float:
         rules = active_rules(self.cfg, mood) if rules is None else rules
-        total = sum(w * feature_value(features, n)
-                    for n, w in self.cfg.get("base_weights", {}).items())
+        total = _contribution(self.cfg.get("base_weights", {}), features)
         for rule in rules:
-            total += mood_weight * sum(w * feature_value(features, n)
-                                       for n, w in rule.get("weights", {}).items())
+            total += mood_weight * _contribution(rule.get("weights", {}), features)
+        for craving in cravings or []:
+            total += _contribution(craving.get("weights", {}), features)
         return float(total)
 
 
-# --- Phase 2: LinUCB -----------------------------------------------------------------------
+# --- LinUCB --------------------------------------------------------------------------------
 def time_bucket(hour: int) -> str:
     if 5 <= hour < 11:
         return "morning"
@@ -182,6 +223,32 @@ class LinUCB:
         return self
 
 
+# --- diversity -----------------------------------------------------------------------------
+def diversify(ranked: list[Ranked], k: int, max_per_cuisine: int = 2,
+              repeat_penalty: float = 0.4) -> list[Ranked]:
+    """Greedy top-k: each earlier pick of the same cuisine costs `repeat_penalty`, and no
+    cuisine appears more than `max_per_cuisine` times (unknown cuisines aren't capped)."""
+    pool = sorted(ranked, key=lambda x: x.score, reverse=True)
+    picked: list[Ranked] = []
+    counts: Counter[str] = Counter()
+    while pool and len(picked) < k:
+        best_i, best_s = None, -np.inf
+        for i, item in enumerate(pool):
+            c = item.restaurant.cuisine
+            known = c and c != "unknown"
+            if known and counts[c] >= max_per_cuisine:
+                continue
+            s = item.score - (repeat_penalty * counts[c] if known else 0.0)
+            if s > best_s:
+                best_i, best_s = i, s
+        if best_i is None:  # everything left is capped; fill with the best remaining
+            best_i = 0
+        item = pool.pop(best_i)
+        counts[item.restaurant.cuisine] += 1
+        picked.append(item)
+    return picked
+
+
 # --- combined recommender ------------------------------------------------------------------
 class Recommender:
     def __init__(self, cfg: dict[str, Any] | None = None):
@@ -190,6 +257,10 @@ class Recommender:
         self.min_events = int(bandit.get("min_events", 20))
         self.alpha = float(bandit.get("alpha", 0.6))
         self.ridge = float(bandit.get("ridge", 1.0))
+        self.bandit_weight = float(bandit.get("weight", 1.0))
+        div = self.cfg.get("diversity") or {}
+        self.max_per_cuisine = int(div.get("max_per_cuisine", 2))
+        self.repeat_penalty = float(div.get("repeat_penalty", 0.4))
         self.rules = RuleRanker(self.cfg)
         self.bandit: LinUCB | None = None
 
@@ -205,18 +276,21 @@ class Recommender:
     def policy(self) -> str:
         return "linucb" if self.bandit is not None else "rules"
 
+    def queries(self, mood: MoodVector, cravings: Iterable[str] = ()) -> list[str]:
+        return search_queries(self.cfg, mood, cravings)
+
     def rank(self, mood: MoodVector, restaurants: list[Restaurant], max_distance_m: float,
-             hour: int, k: int = 5, mood_weight: float = 1.0) -> list[Ranked]:
+             hour: int, k: int = 5, mood_weight: float = 1.0,
+             cravings: Iterable[str] = ()) -> list[Ranked]:
         rules = active_rules(self.cfg, mood)
+        crav = active_cravings(self.cfg, cravings)
         ranked = []
         for r in restaurants:
             feats = r.features(max_distance_m)
-            why = explain(self.cfg, rules, feats, mood_weight)
+            why = explain(self.cfg, rules, feats, mood_weight, crav)
+            score = self.rules.score(mood, feats, rules, mood_weight, crav)
             if self.bandit is not None:
-                score = self.bandit.ucb(context_vector(mood, feats, hour))
+                score += self.bandit_weight * self.bandit.ucb(context_vector(mood, feats, hour))
                 why = why.rstrip(".") + ", tuned by your past picks."
-            else:
-                score = self.rules.score(mood, feats, rules, mood_weight)
             ranked.append(Ranked(r, score, why, self.policy, feats))
-        ranked.sort(key=lambda x: x.score, reverse=True)
-        return ranked[:k]
+        return diversify(ranked, k, self.max_per_cuisine, self.repeat_penalty)

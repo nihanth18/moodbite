@@ -17,8 +17,8 @@ from streamlit_js_eval import streamlit_js_eval
 
 from emotion import EMOTIONS, EmotionAnalyzer, MoodVector, decode_image
 from places import (
-    HYDERABAD, PlacesClient, PlacesError, demo_restaurants, filter_candidates, haversine_m,
-    parse_browser_location,
+    CUISINE_GROUPS, HYDERABAD, PlacesClient, PlacesError, Restaurant, demo_search,
+    filter_candidates, haversine_m, parse_browser_location,
 )
 from ranker import Recommender, load_rules
 from storage import Storage
@@ -26,20 +26,22 @@ from train import train_baseline
 
 APP_DIR = Path(__file__).parent
 load_dotenv(APP_DIR / ".env")
+PLACEHOLDERS = ("", "your-api-key-here", "your-database-url-here")
 
 
-def _api_key() -> str:
-    key = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
-    if not key:
-        try:  # Streamlit Community Cloud / .streamlit/secrets.toml
-            key = str(st.secrets.get("GOOGLE_PLACES_API_KEY", "")).strip()
+def _secret(name: str) -> str:
+    """Environment / .env first, then Streamlit secrets (Community Cloud). Placeholders = unset."""
+    value = os.getenv(name, "").strip()
+    if not value:
+        try:
+            value = str(st.secrets.get(name, "")).strip()
         except Exception:
-            key = ""
-    # The placeholder in .env / .env.example counts as "no key", so the app stays in demo mode
-    return "" if key.lower() in ("", "your-api-key-here") else key
+            value = ""
+    return "" if value.lower() in PLACEHOLDERS else value
 
 
-API_KEY = _api_key()
+API_KEY = _secret("GOOGLE_PLACES_API_KEY")
+DATABASE_URL = _secret("DATABASE_URL")
 DEMO_DEFAULT = "--demo" in sys.argv[1:] or os.getenv("MOODBITE_DEMO") == "1" or not API_KEY
 
 # Ask for a GPS-grade fix (enableHighAccuracy) and watch for up to 10 s, keeping the most
@@ -85,8 +87,10 @@ MOODS = {
 }
 TAG_LABELS = {"comfort_food": "Comfort food", "quick_service": "Quick",
               "lively": "Lively", "quiet": "Quiet", "dessert": "Desserts",
-              "familiar": "Popular"}
+              "familiar": "Popular", "outdoor": "Outdoor", "spicy": "Spicy",
+              "light": "Light", "coffee": "Coffee"}
 RATING_OPTIONS = {"4.0+": 4.0, "4.3+": 4.3, "4.5+": 4.5}
+DIETS = {"Any": "any", "Veg options": "veg_options", "Pure veg": "pure_veg"}
 
 CSS = """
 <style>
@@ -165,8 +169,20 @@ def get_analyzer() -> EmotionAnalyzer:
 
 @st.cache_resource
 def get_storage() -> Storage:
+    if DATABASE_URL:  # hosted Postgres: feedback survives restarts and redeploys
+        return Storage(DATABASE_URL)
     db = os.getenv("MOODBITE_DB") or "moodbite.db"
     return Storage(db if os.path.isabs(db) else APP_DIR / db)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_places(lat: float, lng: float, radius_m: float, min_rating: float,
+                 queries: tuple[str, ...], demo: bool) -> list[Restaurant]:
+    """Cached for 10 minutes per (rounded) location and settings, so a repeat search doesn't
+    cost more Google calls. Opening hours can change, hence the short lifetime."""
+    if demo:
+        return demo_search(lat, lng, queries)
+    return PlacesClient(API_KEY).search(lat, lng, radius_m, min_rating, queries)
 
 
 def get_recommender() -> Recommender:
@@ -333,8 +349,16 @@ if mood:
         with st.expander("Emotion scores"):
             st.bar_chart(mood.probs, horizontal=True, height=220, color="#111111")
 
-# --- 2. where ---------------------------------------------------------------------------------
-step(2, "Location")
+# --- 2. taste ---------------------------------------------------------------------------------
+step(2, "Taste")
+diet_label = st.segmented_control("Diet", list(DIETS), default="Any") or "Any"
+diet = DIETS[diet_label]
+cravings = st.pills("Craving anything? Optional, pick any.", list(get_config()["cravings"]),
+                    selection_mode="multi", key="cravings") or []
+skip_cuisines = st.multiselect("Leave out", list(CUISINE_GROUPS), placeholder="No exclusions")
+
+# --- 3. where ---------------------------------------------------------------------------------
+step(3, "Location")
 mode = st.segmented_control("Location", ["Near me", "Search an area"], default="Near me",
                             label_visibility="collapsed") or "Near me"
 place_query, lat, lng = None, None, None
@@ -384,33 +408,36 @@ if find:
     max_m = max_km * 1000
     try:
         with st.spinner("Searching"):
-            if demo:
-                if lat is None:
-                    lat, lng = HYDERABAD
-                places = demo_restaurants(lat, lng)
-            else:
-                client = PlacesClient(API_KEY)
-                if lat is None:
-                    lat, lng = client.geocode(place_query)
-                places = client.search(lat, lng, max_m, min_rating)
-        candidates = filter_candidates(places, max_m, min_rating=min_rating)
+            if lat is None:
+                lat, lng = HYDERABAD if demo else PlacesClient(API_KEY).geocode(place_query)
+            # Mood and cravings decide which extra searches run, so they change WHICH places
+            # are considered, not only the order.
+            queries = tuple(rec.queries(mood, cravings))
+            places = fetch_places(round(lat, 4), round(lng, 4), max_m, min_rating, queries,
+                                  demo)
+        candidates = filter_candidates(places, max_m, min_rating=min_rating, diet=diet,
+                                       skip_cuisines=skip_cuisines)
         weight = 0.5 if status == "uncertain" else 1.0
         st.session_state.results = rec.rank(mood, candidates, max_m, datetime.now().hour,
-                                            k=5, mood_weight=weight)
+                                            k=5, mood_weight=weight, cravings=cravings)
         st.session_state.ranked_mood = mood.to_dict()
-        st.session_state.search_desc = (f"Open now. Rated {rating_label}. "
-                                        f"Within {max_km:g} km.")
+        parts = ["Open now", f"Rated {rating_label}", f"Within {max_km:g} km"]
+        if diet != "any":
+            parts.append(diet_label)
+        if queries:
+            parts.append("Searched for " + ", ".join(queries))
+        st.session_state.search_desc = ". ".join(parts) + "."
         st.session_state.feedback = {}
         if not candidates:
-            note(f"No open places rated {min_rating}+ within {max_km:g} km right now. "
-                 "Try a longer distance or a lower minimum rating.")
+            note(f"No open places rated {min_rating}+ within {max_km:g} km match right now. "
+                 "Try a longer distance, a lower minimum rating, or fewer exclusions.")
     except PlacesError as e:
         note(str(e))
 
-# --- 3. results ------------------------------------------------------------------------------
+# --- 4. results ------------------------------------------------------------------------------
 results = st.session_state.results
 if results:
-    step(3, "Suggestions")
+    step(4, "Suggestions")
     st.markdown(f'<div class="x-small">{html.escape(st.session_state.get("search_desc", ""))}'
                 '</div>', unsafe_allow_html=True)
     for i, item in enumerate(results):
@@ -420,13 +447,21 @@ if results:
             facts = [f"{r.rating:.1f} / 5 from {fmt_count(r.user_rating_count)} reviews"]
             facts += [html.escape(cuisine)] if cuisine else []
             facts.append(travel(r.distance_m))
-            tags = "".join(f'<span class="x-tag">{TAG_LABELS[t]}</span>'
-                           for t in TAG_LABELS if item.features.get(t))
+            # Only strong evidence becomes a visible tag (weak hints like "serves dessert",
+            # which most restaurants do, still count in the score).
+            labels = ["Pure veg"] if r.pure_veg else []
+            labels += [TAG_LABELS[t] for t in TAG_LABELS if item.features.get(t, 0) >= 1.0]
+            tags = "".join(f'<span class="x-tag">{html.escape(t)}</span>' for t in labels)
+            matched = (f'<div class="x-small">Found by searching for '
+                       f'{html.escape(", ".join(r.matched_queries))}</div>'
+                       if r.matched_queries else "")
+            summary = (f'<div class="x-facts" style="margin-top:6px">{html.escape(r.summary)}'
+                       '</div>' if r.summary else "")
             st.markdown(
                 f'<div class="x-rank">{i + 1:02d}</div>'
                 f'<div class="x-name">{html.escape(r.name)}</div>'
-                f'<div class="x-facts">{" &nbsp;·&nbsp; ".join(facts)}</div>'
-                f'<div class="x-why">{html.escape(item.why)}</div><div>{tags}</div>',
+                f'<div class="x-facts">{" &nbsp;·&nbsp; ".join(facts)}</div>{summary}'
+                f'<div class="x-why">{html.escape(item.why)}</div><div>{tags}</div>{matched}',
                 unsafe_allow_html=True)
             given = st.session_state.feedback.get(r.id)
             b1, b2, b3 = st.columns(3)
@@ -445,16 +480,26 @@ if results:
                         st.rerun()
 
 # --- settings --------------------------------------------------------------------------------
-step(4 if results else 3, "Settings")
+step(5 if results else 4, "Settings")
 with st.expander("Settings and your data"):
     st.toggle("Demo mode", value=DEMO_DEFAULT, key="demo")
     if not st.session_state.get("demo", DEMO_DEFAULT) and not API_KEY:
         note("No Google Places API key is set (in .env or Streamlit secrets).")
-    n_events = store.count()
-    c1, c2 = st.columns(2)
-    c1.metric("Feedback given", n_events)
-    c2.metric("Ranking", "Learned" if rec.policy == "linucb" else "Rules",
-              help=f"Learns from your feedback (LinUCB) after {rec.min_events} responses.")
+    m = store.metrics()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Feedback given", m["n"])
+    c2.metric("Going rate", "–" if m["rate"] is None else f"{m['rate']:.0%}",
+              help="Share of suggestions you marked Going. This is the accuracy measure: "
+                   "it should rise as the app learns.")
+    c3.metric("Ranking", "Learned" if rec.policy == "linucb" else "Rules",
+              help=f"Adds what it learned from your feedback (LinUCB) after "
+                   f"{rec.min_events} responses.")
+    by = m["by_policy"]
+    if len(by) > 1:
+        st.caption("Going rate by ranking: " + ", ".join(
+            f"{'learned' if p == 'linucb' else p} {v['rate']:.0%} of {v['n']}"
+            for p, v in by.items() if v["rate"] is not None))
+    st.caption(f"Feedback storage: {store.label}.")
     if st.button("Retrain from my feedback", use_container_width=True):
         events = store.load_events()
         rec.retrain(events)

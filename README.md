@@ -62,18 +62,34 @@ phone, with no certificate warning and no PC left running.
    Pick the repo, branch `main`, main file `app.py`.
 3. Open **Advanced settings**:
    - **Python version:** 3.11
-   - **Secrets:** paste `GOOGLE_PLACES_API_KEY = "your real key"` (see `.streamlit/secrets.toml.example`)
+   - **Secrets:** paste `GOOGLE_PLACES_API_KEY = "your real key"`, plus `DATABASE_URL = "..."`
+     if you set up a database (see below and `.streamlit/secrets.toml.example`)
 4. Click **Deploy**. The first build takes a few minutes, because MediaPipe and ONNX are large.
    `packages.txt` installs the system libraries OpenCV needs.
 5. **Lock it down.** In the app's **Settings → Sharing**, restrict viewers to specific email
    addresses. Anyone with a public link can otherwise run searches on your Google bill.
 6. **Protect the key.** In Google Cloud → Credentials, restrict the key to *Places API (New)*
-   and set a daily quota or budget alert. Each search makes 2 Places calls (nearby + top-rated).
+   and set a daily quota or budget alert. Each search makes 2–5 Places calls (nearby,
+   top-rated, and up to 3 mood/craving searches, set by `retrieval.max_queries`). They request
+   restaurant attributes (live music, outdoor seating, vegetarian, …), which Google bills at a
+   higher tier than basic fields. Identical searches within 10 minutes are served from cache.
+
+### Keep feedback permanently (hosted database)
+
+Community Cloud's disk is temporary, so without a database the feedback log is wiped whenever
+the app restarts, and the learned ranking never builds up. Any Postgres database works:
+
+1. Create a free Postgres database, e.g. at **neon.tech** (or Supabase).
+2. Copy its connection string. It looks like
+   `postgresql://user:password@host/dbname?sslmode=require`.
+3. Add it to the app's **Settings → Secrets** as `DATABASE_URL = "..."` and save. The app
+   creates its `feedback` table on first use. Settings in the app then says
+   "Feedback storage: Hosted database".
+
+Locally, leave `DATABASE_URL` unset to use the SQLite file.
 
 Things to know about Community Cloud:
-- **Feedback resets on restart.** The server's disk is temporary, so the SQLite feedback log
-  is wiped when the app restarts or redeploys. To keep learning long-term, move `storage.py` to a
-  hosted database (e.g. Postgres) later.
+- **Feedback resets on restart** unless `DATABASE_URL` is set (see above).
 - **The app sleeps** after a period without visitors. The first visit after that takes about a minute to wake it.
 - **Photos are processed on Streamlit's servers** (in memory, never saved), not on your PC.
   The in-app privacy note says "on the MoodBite server" for this reason.
@@ -84,16 +100,19 @@ plus `GOOGLE_PLACES_API_KEY` as an environment variable.
 
 ## Using the app
 
-1. **How are you feeling?** Take a selfie (after ticking consent) or tap a mood. After a
-   selfie you can correct the detected mood in one tap.
-2. **Where are you?** *Near me* uses your phone's GPS (high-accuracy fix, error margin shown,
-   *Refresh* button), or search an area by name. Set how far you'll go and a minimum rating
-   (4.0★, 4.3★ or 4.5★).
-3. **Your top picks.** Five open, top-rated places, each with rating, review count, distance,
-   walk or drive time, a one-line reason, mood tags, a **Directions** button (Google Maps), and
-   **Going here** / **Not for me** feedback.
+1. **Mood.** Take a photo (after ticking consent) or choose a mood. After a photo you can
+   correct the detected mood in one tap.
+2. **Taste.** Diet (*Any*, *Veg options*, *Pure veg*), optional cravings (*Spicy*, *Sweet*,
+   *Light*, *Hearty*, *Coffee*, *Drinks*), and cuisines to leave out.
+3. **Location.** *Near me* uses your phone's GPS (high-accuracy fix, error margin shown,
+   *Refresh* button), or search an area by name. Set how far you'll go (up to 20 km) and a
+   minimum rating (4.0, 4.3 or 4.5).
+4. **Suggestions.** Five open, top-rated places (at most two of any cuisine), each with rating,
+   review count, distance, walk or drive time, Google's description when there is one, a
+   one-line reason, tags, which mood search found it, a **Directions** button and
+   **Going** / **Not for me** feedback.
 
-Settings (demo mode, retraining, deleting your data) are at the bottom of the page.
+Settings (demo mode, Going rate, retraining, deleting your data) are at the bottom of the page.
 
 ## How it works
 
@@ -103,44 +122,69 @@ photo ─► MediaPipe face detection ─► crop ─► HSEmotion (enet_b0_8_va
           ▼
      mood vector: 7 emotion probs + valence + arousal   (image discarded here)
           ▼
-Places: searchNearby + searchText(openNow, minRating) ─► merge ─► filter: open now,
-        rating ≥ 4.0 (or your choice), ≥ 30 reviews, within distance ─► feature tagging
+mood + cravings ─► up to 3 targeted searches (e.g. stressed → "desserts", "quiet cafe")
           ▼
-ranker: rules (<20 feedback events) or LinUCB (≥20) ─► top 5 + one-line "why"
+Places: searchNearby + searchText("restaurants") + searchText(each query), all open now,
+        rating ≥ 4.0, inside your distance ─► merge (remember which search found each place)
           ▼
-"Going here" / "Not for me" ─► SQLite (numbers + restaurant features only)
+filter: ≥ 30 reviews, diet, excluded cuisines ─► tags from Google attributes, types,
+        name and description
+          ▼
+score = rules (rating, distance, mood, cravings, matched search) + LinUCB (after 20 events)
+          ▼
+top 5 with at most 2 per cuisine + one-line "why"
+          ▼
+"Going" / "Not for me" ─► SQLite or Postgres (numbers + restaurant features only)
 ```
 
 | File | What it does |
 |---|---|
 | `app.py` | Streamlit UI (mobile-first; theme in `.streamlit/config.toml`). |
 | `emotion.py` | MediaPipe face detection (Tasks API) and HSEmotion emotion, valence and arousal. Handles no face, multiple faces (refused: only the consenting user is analysed), low detection confidence, tiny faces, and uncertain expressions (used at half weight). |
-| `places.py` | Places API (New) client, best-rated filtering, feature tagging, demo data. |
-| `ranker.py` | Rule ranker driven by `config/mood_rules.yaml`, plus LinUCB and the `Recommender` that switches between them. |
-| `storage.py` | SQLite feedback log, with "delete all my data". |
+| `places.py` | Places API (New) client (nearby, top-rated and per-query text searches), tagging, diet and cuisine filters, demo data. |
+| `ranker.py` | Mood/craving searches, rule scoring from `config/mood_rules.yaml`, LinUCB, cuisine diversity, and the `Recommender` that combines them. |
+| `storage.py` | Feedback log on SQLite or Postgres (`DATABASE_URL`), Going-rate metrics, "delete all my data". |
 | `train.py` | Offline baseline: SGD logistic regression, prints accuracy and AUC against a majority-class baseline. |
 
-**Best rated.** Ratings are adjusted by review count with a Bayesian average,
-`(n·R + 100·3.9) / (n + 100)`, so a 4.9★ from 5 reviews doesn't beat a 4.6★ from 3,000.
-Places with fewer than 30 reviews are dropped. Rating has the largest weight in the ranking, so
-your mood decides between places that are all highly rated. There is no price filter.
+**Mood decides what is searched.** Each mood rule and craving in `config/mood_rules.yaml` lists
+Google searches (e.g. *stressed* → "desserts", "quiet cafe"; *Spicy* → "biryani", "andhra meals").
+Up to `retrieval.max_queries` (3) run per search, cravings first, so different moods look at
+different places, not just a reordering of the same nearby ones. A place found by one of these
+searches gets an `intent_match` bonus.
 
-**Tags** are inferred from place types and whole-word name keywords: `comfort_food`,
-`quick_service`, `lively`, `quiet`, `dessert`, `familiar` (a known chain or 1000+ reviews).
+**Best rated.** Only open places rated 4.0+ with 30+ reviews are considered. Ratings are
+adjusted by review count with a Bayesian average, `(n·R + 100·3.9) / (n + 100)`, so a 4.9 from 5
+reviews doesn't beat a 4.6 from 3,000. Since everything shown is already well rated, rating
+only breaks ties (weight 1.0). Mood and cravings decide.
 
-**Phase 1, rules.** `config/mood_rules.yaml` maps mood conditions (e.g. `arousal_below: -0.1`)
-to tag weights (e.g. `comfort_food: 1.2`). Score = base weights (rating 2.0, closeness 0.6) + the
-weights of every rule that fires. You can tune it without touching code.
+**Tags** (`comfort_food`, `quick_service`, `lively`, `quiet`, `dessert`, `familiar`, `outdoor`,
+`spicy`, `light`, `coffee`) are scored 0–1 from Google's attributes (live music, cocktails,
+outdoor seating, …), the place type, whole-word keywords in the name and Google's description.
+Strong evidence = 1.0. Weak evidence such as "serves dessert" (true of most restaurants)
+= 0.3–0.5. Only strong tags are shown on cards. *Pure veg* comes from vegetarian place types,
+names like "Pure Veg" or "Udupi", and descriptions, and is never set if the name mentions meat.
 
-**Phase 2, LinUCB.** The context is `outer(mood, restaurant).ravel()` plus a one-hot time of day,
-58 dimensions in total:
+**Rules.** Mood conditions (e.g. `arousal_below: -0.3`) and cravings map to feature weights.
+Score = base weights (rating 1.0, closeness 0.5, intent match 0.8) + every rule that fires +
+every craving chosen. You can tune it without touching code.
+
+**LinUCB.** The context is `outer(mood, restaurant).ravel()` plus a one-hot time of day,
+88 dimensions in total:
 - mood (6): bias, valence, arousal, stress, sad, happy
-- restaurant (9): bias, rating, closeness and the 6 tags
+- restaurant (14): bias, rating, closeness, intent match and the 10 tags
 - time of day (4)
 
-It is a shared-parameter LinUCB with reward 1 for "Going here" and 0 for "Not for me", scoring
-θᵀx + α·√(xᵀA⁻¹x). It is refit from SQLite at startup and on **Retrain**. Below 20 events
-the app uses the rules.
+Reward is 1 for "Going" and 0 for "Not for me", scoring θᵀx + α·√(xᵀA⁻¹x). Once there are 20
+feedback events, this learned score is **added** to the rule score instead of replacing it, so
+cravings and diet keep working while it learns what you actually pick. It is refit at startup and
+on **Retrain**.
+
+**Variety.** The top 5 are chosen greedily with at most 2 per cuisine, and each repeat of a
+cuisine costs a small penalty.
+
+**Measuring accuracy.** Settings shows the *Going rate*, the share of suggestions you marked
+Going, overall and by ranking type (rules vs learned). That's the number to watch. It only
+accumulates on hosting if `DATABASE_URL` is set.
 
 ## Privacy
 

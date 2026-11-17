@@ -184,7 +184,11 @@ def test_search_top_rated_request():
     assert session.post.call_args.args[0].endswith("/places:searchText")
     body = session.post.call_args.kwargs["json"]
     assert body["openNow"] is True and body["minRating"] == 4.3
-    assert body["locationBias"]["circle"]["radius"] == 2000.0
+    assert body["textQuery"] == "restaurants"
+    rect = body["locationRestriction"]["rectangle"]
+    # 2 km either side of the centre (≈0.018° of latitude)
+    assert rect["low"]["latitude"] < ORIGIN[0] < rect["high"]["latitude"]
+    assert abs((rect["high"]["latitude"] - ORIGIN[0]) - 2000 / 111_320) < 1e-6
 
 
 def test_search_merges_and_dedupes():
