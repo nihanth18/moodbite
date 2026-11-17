@@ -368,7 +368,7 @@ else:
     location_ready = bool(place_query.strip())
 
 c1, c2 = st.columns(2)
-max_km = c1.slider("Distance", 0.5, 10.0, 3.0, 0.5, format="%.1f km")
+max_km = c1.slider("Distance", 0.5, 20.0, 3.0, 0.5, format="%.1f km")
 rating_label = c2.segmented_control("Minimum rating", list(RATING_OPTIONS),
                                     default="4.0+") or "4.0+"
 min_rating = RATING_OPTIONS[rating_label]
