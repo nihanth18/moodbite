@@ -1,0 +1,4 @@
+# Local development: tests + the HTTPS certificate script for phone testing on Wi-Fi.
+-r requirements.txt
+pytest==9.2.0
+cryptography==50.0.2

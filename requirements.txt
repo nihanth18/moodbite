@@ -1,0 +1,13 @@
+# Runtime dependencies (what the hosted app installs). Versions are the ones tested locally.
+# For tests and the local HTTPS script: pip install -r requirements-dev.txt
+streamlit==1.67.0
+streamlit-js-eval==1.0.0
+mediapipe==1.2.3
+hsemotion-onnx==0.3.1
+onnxruntime==1.32.0
+numpy==2.4.6
+scikit-learn==1.9.1
+PyYAML==6.0.3
+requests==2.34.2
+python-dotenv==1.2.4
+pillow==13.0.0
